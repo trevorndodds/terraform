@@ -1,0 +1,21 @@
+<script>
+tzutil.exe /s "Eastern Standard Time"
+</script>
+<powershell>
+$AppCode = "000"
+$IPAddress = Invoke-RestMethod http://169.254.169.254/latest/meta-data/local-ipv4
+$instanceID = Invoke-RestMethod http://169.254.169.254/latest/meta-data/instance-id
+$serverName = ('GN' + (Get-Date -Format 'ddHHmm') + $IPAddress.split(".")[2] + $IPAddress.split(".")[3])
+Try{
+    Write-S3Object -Region ca-central-1 -BucketName gridbucket -Key ec2-instances/$instanceID -Content ($serverName)
+    Set-Disk -Number 1 -IsReadOnly $false
+    Set-Disk -Number 1 -IsOffline $false
+    Get-Partition -DiskNumber 1 | Set-Partition -NewDriveLetter F
+    Set-Volume -DriveLetter F -NewFileSystemLabel "NT_APPS"
+    F:\DataSynapse\Engine\ds5-install-service.ps1 -serverName $serverName
+}
+Catch{
+    Write-S3Object -Region ca-central-1 -BucketName gridbucket -Key ec2-instances/fail_ds_$instanceID -Content $_
+    Stop-Computer
+}
+</powershell>
