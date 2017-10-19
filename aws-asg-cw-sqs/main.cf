@@ -1,0 +1,142 @@
+provider "aws" {
+ region = "${var.aws_region}"
+ profile = "${var.aws_profile}"
+ assume_role {
+  role_arn = "${var.assume_role_arn}"
+  session_name = "${var.aws_profile}"
+ }
+}
+
+resource "aws_launch_configuration" "lc" {
+ name_prefix = "appCode-"
+ image_id = "${var.custom_ami}"
+ instance_type = "${var.instance_type}"
+ enable_monitoring = false
+ security_groups = ["${var.security_groups}"]
+ iam_instance_profile = "${var.iam_profile}"
+ key_name = "${var.key_name}"
+ user_data = "${file("gridUserData.txt")}"
+ root_block_device {
+  volume_type = "gp2"
+  volume_size = "30"
+  delete_on_termination = true
+ }
+ ebs_block_device {
+  device_name = "/dev/xvdb"
+  snapshot_id = "${var.snapshot_id}"
+  volume_size = "50"
+  volume_type = "gp2"
+  delete_on_termination = true
+  }
+ lifecycle {
+  create_before_destroy = true
+ }
+}
+
+resource "aws_cloudwatch_metric_alarm" "cwup" {
+  alarm_name                = "GridPendAlarm"
+  comparison_operator       = "GreaterThanOrEqualToThreshold"
+  evaluation_periods        = "1"
+  metric_name               = "PendingTasks"
+  namespace                 = "appCode/DataSynapse"
+  period                    = "60"
+  statistic                 = "Maximum"
+  threshold                 = "5000"
+  alarm_description         = "ScaleUp engines"
+  insufficient_data_actions = []
+  dimensions {
+    "Per-Grid Metrics" = "Grid"
+  }
+  alarm_actions     = ["${aws_autoscaling_policy.asgup.arn}"]
+}
+
+resource "aws_cloudwatch_metric_alarm" "cwdown" {
+  alarm_name                = "GridPendAlarmOK"
+  comparison_operator       = "LessThanOrEqualToThreshold"
+  evaluation_periods        = "1"
+  metric_name               = "PendingTasks"
+  namespace                 = "THG0/DataSynapse"
+  period                    = "60"
+  statistic                 = "Maximum"
+  threshold                 = "100"
+  alarm_description         = "ScaleDown engines"
+  insufficient_data_actions = []
+  dimensions {
+    "Per-Grid Metrics" = "Grid"
+  }
+  alarm_actions     = ["${aws_autoscaling_policy.asgdown.arn}"]
+}
+
+resource "aws_autoscaling_group" "asg" {
+ availability_zones = ["ca-central-1a","ca-central-1b"]
+ name = "asg-${aws_launch_configuration.lc.id}"
+ vpc_zone_identifier = "${var.custom_subnets}"
+ enabled_metrics = ["GroupMinSize", "GroupMaxSize", "GroupDesiredCapacity", "GroupInServiceInstances", "GroupPendingInstances", "GroupStandbyInstances", "GroupTerminatingInstances", "GroupTotalInstances"]
+ max_size = "${var.asg_max}"
+ min_size = "${var.asg_min}"
+ health_check_grace_period = 300
+ default_cooldown = 60
+ health_check_type = "EC2"
+ force_delete = false
+ launch_configuration = "${aws_launch_configuration.lc.name}"
+ termination_policies = ["ClosestToNextInstanceHour"]
+
+ tag {
+  key = "AppCode"
+  value = "000"
+  propagate_at_launch = true
+  }
+}
+
+resource "aws_autoscaling_policy" "asgup" {
+  name                   = "GridPendAlarm"
+  scaling_adjustment     = 100
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 10
+  autoscaling_group_name = "${aws_autoscaling_group.asg.name}"
+}
+
+resource "aws_autoscaling_policy" "asgdown" {
+  name                   = "GridPendAlarmOK"
+  scaling_adjustment     = -100
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 10
+  autoscaling_group_name = "${aws_autoscaling_group.asg.name}"
+}
+
+resource "aws_autoscaling_lifecycle_hook" "lch" {
+  name                   = "lch-${aws_launch_configuration.lc.id}"
+  autoscaling_group_name = "${aws_autoscaling_group.asg.name}"
+  default_result         = "CONTINUE"
+  heartbeat_timeout      = 120
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
+  notification_target_arn = "${aws_sqs_queue.sysq.arn}"
+  role_arn                = "${var.role_arn}"
+}
+
+resource "aws_sqs_queue" "sysq" {
+  name                      = "sqs-hook"
+  delay_seconds             = 0
+  max_message_size          = 2048
+  message_retention_seconds = 10800
+  receive_wait_time_seconds = 0
+}
+
+resource "aws_sqs_queue_policy" "sysqp" {
+  queue_url = "${aws_sqs_queue.sysq.id}"
+    policy = <<POLICY
+{
+  "Version": "2012-10-17",
+  "Id": "sqspolicy",
+  "Statement": [
+    {
+      "Sid": "First",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "SQS:*",
+      "Resource": "${aws_sqs_queue.sysq.arn}"
+    }
+  ]
+}
+POLICY
+}
